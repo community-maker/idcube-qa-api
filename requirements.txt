@@ -1,0 +1,11 @@
+requests
+beautifulsoup4
+lxml
+markdownify
+trafilatura
+pypdf
+chromadb
+sentence-transformers
+anthropic
+fastapi
+uvicorn
