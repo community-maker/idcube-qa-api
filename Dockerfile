@@ -13,6 +13,7 @@ COPY ask.py api.py ./
 COPY chroma_db ./chroma_db
 
 ENV CHROMA_DIR=/app/chroma_db
+ENV PYTHONUNBUFFERED=1
 
 # Render injects $PORT at runtime; default to 8000 for local/manual runs.
 CMD uvicorn api:app --host 0.0.0.0 --port ${PORT:-8000}

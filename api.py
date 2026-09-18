@@ -18,6 +18,7 @@ Endpoints:
 """
 
 import os
+import traceback
 
 import chromadb
 from fastapi import FastAPI, HTTPException
@@ -63,7 +64,11 @@ def health():
 def ask(req: AskRequest):
     if not req.question or not req.question.strip():
         raise HTTPException(status_code=400, detail="question must not be empty")
-    answer, sources = answer_question(
-        req.question, _state["model"], _state["collection"], _state["client"], _state["llm_model"]
-    )
+    try:
+        answer, sources = answer_question(
+            req.question, _state["model"], _state["collection"], _state["client"], _state["llm_model"]
+        )
+    except Exception:
+        # TODO: remove this debug detail once the Render deploy is confirmed working.
+        raise HTTPException(status_code=500, detail=traceback.format_exc())
     return AskResponse(answer=answer, sources=sources)
