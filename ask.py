@@ -18,9 +18,15 @@ import os
 import sys
 
 import chromadb
-from sentence_transformers import SentenceTransformer
 
-MODEL_NAME = "all-MiniLM-L6-v2"
+# Embedding is handled by Chroma's built-in default embedding function (a
+# local ONNX build of all-MiniLM-L6-v2, via onnxruntime) rather than
+# sentence-transformers/torch -- functionally the same model, but without
+# torch's ~400MB+ runtime footprint, which matters on a memory-capped free
+# hosting tier. Both build_index.py (index time) and this module (query
+# time) must use the same embedding function for search to work, which
+# Chroma's collection object handles automatically as long as neither side
+# overrides it.
 COLLECTION_NAME = "idcube_india"
 TOP_K = 5
 
@@ -32,9 +38,8 @@ directly (contact@idcubesystems.com / +91 7676110110). Do not invent product \
 names, specs, or prices that aren't in the context. Keep answers concise."""
 
 
-def retrieve(question: str, model, collection, k=TOP_K):
-    query_embedding = model.encode([question]).tolist()
-    results = collection.query(query_embeddings=query_embedding, n_results=k)
+def retrieve(question: str, collection, k=TOP_K):
+    results = collection.query(query_texts=[question], n_results=k)
     chunks = []
     for doc, meta in zip(results["documents"][0], results["metadatas"][0]):
         chunks.append({"text": doc, **meta})
@@ -48,8 +53,8 @@ def build_context(chunks):
     return "\n\n---\n\n".join(parts)
 
 
-def answer_question(question: str, model, collection, anthropic_client, llm_model: str):
-    chunks = retrieve(question, model, collection)
+def answer_question(question: str, collection, anthropic_client, llm_model: str):
+    chunks = retrieve(question, collection)
     context = build_context(chunks)
 
     message = anthropic_client.messages.create(
@@ -82,8 +87,7 @@ def main():
     import anthropic
     client = anthropic.Anthropic()
 
-    print("Loading embedding model and index...")
-    model = SentenceTransformer(MODEL_NAME)
+    print("Loading index...")
     chroma_client = chromadb.PersistentClient(path=args.persist_dir)
     collection = chroma_client.get_collection(COLLECTION_NAME)
     print(f"Ready. Index has {collection.count()} chunks.\n")
@@ -96,7 +100,7 @@ def main():
     for q in questions:
         if not q:
             break
-        answer, sources = answer_question(q, model, collection, client, args.llm_model)
+        answer, sources = answer_question(q, collection, client, args.llm_model)
         print(f"\n{answer}\n")
         print("Sources:")
         for s in sources:

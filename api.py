@@ -21,9 +21,8 @@ import os
 import chromadb
 from fastapi import FastAPI, HTTPException
 from pydantic import BaseModel
-from sentence_transformers import SentenceTransformer
 
-from ask import MODEL_NAME, COLLECTION_NAME, retrieve
+from ask import COLLECTION_NAME, retrieve
 
 app = FastAPI(title="IDCUBE Search API", version="1.0")
 
@@ -32,7 +31,6 @@ _state = {}
 
 @app.on_event("startup")
 def load_index():
-    _state["model"] = SentenceTransformer(MODEL_NAME)
     chroma_client = chromadb.PersistentClient(path=os.environ.get("CHROMA_DIR", "chroma_db"))
     _state["collection"] = chroma_client.get_collection(COLLECTION_NAME)
 
@@ -63,7 +61,7 @@ def health():
 def search(req: SearchRequest):
     if not req.question or not req.question.strip():
         raise HTTPException(status_code=400, detail="question must not be empty")
-    chunks = retrieve(req.question, _state["model"], _state["collection"], k=req.top_k)
+    chunks = retrieve(req.question, _state["collection"], k=req.top_k)
     results = [
         SearchResult(
             text=c["text"],
