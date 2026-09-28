@@ -28,7 +28,7 @@ import chromadb
 # Chroma's collection object handles automatically as long as neither side
 # overrides it.
 COLLECTION_NAME = "idcube_india"
-TOP_K = 5
+TOP_K = 8
 
 SYSTEM_PROMPT = """You are a support assistant for IDCUBE Systems' India website \
 (idcubesystems.com/in/en). Answer ONLY using the provided context chunks -- \
@@ -39,10 +39,18 @@ names, specs, or prices that aren't in the context. Keep answers concise."""
 
 
 def retrieve(question: str, collection, k=TOP_K):
-    results = collection.query(query_texts=[question], n_results=k)
-    chunks = []
+    # build_index.py stores two vectors per chunk (plain + title/heading
+    # context), so over-fetch and keep each chunk once, in best-match order.
+    results = collection.query(query_texts=[question], n_results=min(k * 2, collection.count()))
+    chunks, seen = [], set()
     for doc, meta in zip(results["documents"][0], results["metadatas"][0]):
+        chunk_id = meta.get("chunk_id") or doc
+        if chunk_id in seen:
+            continue
+        seen.add(chunk_id)
         chunks.append({"text": doc, **meta})
+        if len(chunks) == k:
+            break
     return chunks
 
 

@@ -12,7 +12,7 @@ Run:
   uvicorn api:app --host 0.0.0.0 --port 8000
 
 Endpoints:
-  POST /search   {"question": "...", "top_k": 5}  ->  {"results": [...]}
+  POST /search   {"question": "...", "top_k": 8}  ->  {"results": [...]}
   GET  /health
 """
 
@@ -22,7 +22,7 @@ import chromadb
 from fastapi import FastAPI, HTTPException
 from pydantic import BaseModel
 
-from ask import COLLECTION_NAME, retrieve
+from ask import COLLECTION_NAME, TOP_K, retrieve
 
 app = FastAPI(title="IDCUBE Search API", version="1.0")
 
@@ -37,7 +37,7 @@ def load_index():
 
 class SearchRequest(BaseModel):
     question: str
-    top_k: int = 5
+    top_k: int = TOP_K
 
 
 class SearchResult(BaseModel):
@@ -54,7 +54,10 @@ class SearchResponse(BaseModel):
 @app.get("/health")
 def health():
     collection = _state.get("collection")
-    return {"status": "ok", "chunks_indexed": collection.count() if collection else 0}
+    if collection is None:
+        return {"status": "ok", "chunks_indexed": 0}
+    unique = (collection.metadata or {}).get("unique_chunks", collection.count())
+    return {"status": "ok", "chunks_indexed": unique}
 
 
 @app.post("/search", response_model=SearchResponse)
