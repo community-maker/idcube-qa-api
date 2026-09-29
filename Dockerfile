@@ -10,7 +10,7 @@ RUN pip install --no-cache-dir -r requirements.txt
 # tier spins the container down after inactivity and starts fresh each time).
 RUN python -c "from chromadb.utils.embedding_functions import DefaultEmbeddingFunction; DefaultEmbeddingFunction()(['warm up'])"
 
-COPY ask.py api.py ./
+COPY ask.py api.py chat_proxy.py widget.js ./
 COPY chroma_db ./chroma_db
 
 ENV CHROMA_DIR=/app/chroma_db

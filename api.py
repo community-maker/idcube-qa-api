@@ -14,17 +14,35 @@ Run:
 Endpoints:
   POST /search   {"question": "...", "top_k": 8}  ->  {"results": [...]}
   GET  /health
+  /chat/*        website chat relay to Purple Fabric (see chat_proxy.py)
+  GET  /widget.js      the embeddable chat widget
+  GET  /widget-demo    a bare page with the widget, for testing before embedding
 """
 
 import os
+from pathlib import Path
 
 import chromadb
 from fastapi import FastAPI, HTTPException
+from fastapi.middleware.cors import CORSMiddleware
+from fastapi.responses import FileResponse, HTMLResponse
 from pydantic import BaseModel
 
 from ask import COLLECTION_NAME, TOP_K, retrieve
+from chat_proxy import ALLOWED_ORIGINS, router as chat_router
 
 app = FastAPI(title="IDCUBE Search API", version="1.0")
+# Browsers may only call /chat/* from the IDCUBE site itself. /search is
+# called server-to-server by Purple Fabric, which CORS doesn't affect.
+app.add_middleware(
+    CORSMiddleware,
+    allow_origins=ALLOWED_ORIGINS,
+    allow_methods=["GET", "POST"],
+    allow_headers=["Content-Type"],
+)
+app.include_router(chat_router)
+
+WIDGET_PATH = Path(__file__).with_name("widget.js")
 
 _state = {}
 
@@ -58,6 +76,29 @@ def health():
         return {"status": "ok", "chunks_indexed": 0}
     unique = (collection.metadata or {}).get("unique_chunks", collection.count())
     return {"status": "ok", "chunks_indexed": unique}
+
+
+@app.get("/widget.js", include_in_schema=False)
+def widget():
+    return FileResponse(
+        WIDGET_PATH,
+        media_type="application/javascript",
+        headers={"Cache-Control": "public, max-age=300"},
+    )
+
+
+@app.get("/widget-demo", include_in_schema=False)
+def widget_demo():
+    return HTMLResponse(
+        "<!doctype html><html lang='en'><head><meta charset='utf-8'>"
+        "<meta name='viewport' content='width=device-width,initial-scale=1'>"
+        "<title>IDCUBE chat widget demo</title></head>"
+        "<body style='font-family:sans-serif;padding:40px'>"
+        "<h1>IDCUBE chat widget demo</h1>"
+        "<p>The chat button is in the bottom-right corner.</p>"
+        "<script src='/widget.js' data-api='' defer></script>"
+        "</body></html>"
+    )
 
 
 @app.post("/search", response_model=SearchResponse)
