@@ -1,0 +1,7 @@
+requests
+beautifulsoup4
+lxml
+markdownify
+trafilatura
+pypdf
+chromadb==1.5.9

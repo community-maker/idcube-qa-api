@@ -1,4 +1,4 @@
-chromadb
+chromadb==1.5.9
 fastapi
 uvicorn
 httpx

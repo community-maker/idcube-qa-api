@@ -1,0 +1,70 @@
+# Rebuilds the agent's search index from idcubesystems.com every week and
+# commits it; Render redeploys automatically on the push. Runs on GitHub's
+# servers, so it no longer depends on a laptop being on. A failed run (crawl
+# blocked, index shrank sharply, push rejected) emails the repo owner.
+name: Weekly data refresh
+
+on:
+  schedule:
+    - cron: "30 21 * * 0"   # Monday 03:00 IST (GitHub cron is UTC)
+  workflow_dispatch:         # "Run workflow" button for a manual refresh
+
+permissions:
+  contents: write
+
+concurrency:
+  group: weekly-refresh
+  cancel-in-progress: false
+
+jobs:
+  refresh:
+    runs-on: ubuntu-latest
+    timeout-minutes: 75
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.11"
+          cache: pip
+          cache-dependency-path: pipeline/requirements.txt
+
+      - name: Cache the embedding model
+        uses: actions/cache@v4
+        with:
+          path: ~/.cache/chroma
+          key: chroma-onnx-minilm-v1
+
+      - run: pip install -r pipeline/requirements.txt
+
+      - name: Scrape idcubesystems.com (pages, PDFs, FAQs)
+        run: python pipeline/idcube_scraper.py --region all --out data --include-pdf
+
+      - name: Chunk
+        run: python pipeline/chunker.py --data-dir data --out chunks.jsonl
+
+      - name: Refuse to publish a much smaller index
+        run: python pipeline/check_index_size.py --chunks chunks.jsonl --current chroma_db
+
+      - name: Build the search index
+        run: python pipeline/build_index.py --chunks chunks.jsonl --persist-dir chroma_db
+
+      - name: Commit and push (Render redeploys on push)
+        run: |
+          git config user.name "github-actions[bot]"
+          git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
+          git add chroma_db
+          if git diff --cached --quiet; then
+            echo "Index unchanged; nothing to deploy."
+            exit 0
+          fi
+          git commit -m "Weekly data refresh $(date -u +%F)"
+          git push
+
+      - name: Keep the crawl log for debugging
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: crawl-log
+          path: data/crawl_log.txt
+          retention-days: 30
