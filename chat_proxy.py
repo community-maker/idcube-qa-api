@@ -207,6 +207,64 @@ def _sse(payload: dict) -> str:
     return f"data: {json.dumps(payload, ensure_ascii=False)}\n\n"
 
 
+# The platform sometimes returns its own failures as ordinary reply text,
+# e.g. "I encountered an error processing your request: An error occurred
+# (ServiceUnavailableException) when calling the InvokeModel operation...
+# Bedrock is unable to process your request." Shown raw, that looks broken
+# and leaks internals, so it's caught before reaching the visitor.
+UPSTREAM_ERROR_RE = re.compile(
+    r"I encountered an error processing your request|ServiceUnavailableException|"
+    r"ThrottlingException|ModelTimeoutException|InvokeModel|Bedrock is unable",
+    re.IGNORECASE,
+)
+# Hold back the start of each reply until it's clearly not an error message.
+HOLD_CHARS = 80
+RETRY_DELAY_S = 1.5
+
+
+async def _upstream_events(url: str, query: str, apikey: str):
+    """One attempt at the agent. Yields ("delta"|"final", text), ("keepalive",
+    None), or a final ("error", None). Re-logs in once if the token expired."""
+    for auth_attempt in (1, 2):
+        token = await _tokens.get(_client, force_refresh=(auth_attempt == 2))
+        async with _client.stream(
+            "POST",
+            url,
+            headers={"Authorization": f"Bearer {token}", "apikey": apikey, "Accept": "text/event-stream"},
+            json={"query": query, "response_mode": "stream"},
+        ) as resp:
+            if resp.status_code == 401 and auth_attempt == 1:
+                continue
+            if resp.status_code != 200:
+                log.error("Send message failed: HTTP %s %s", resp.status_code, (await resp.aread())[:300])
+                yield "error", None
+                return
+            async for line in resp.aiter_lines():
+                if not line.startswith("data:"):
+                    continue
+                try:
+                    chunk = json.loads(line[5:].strip())
+                except ValueError:
+                    continue
+                event = chunk.get("event")
+                content = chunk.get("content")
+                if event == "LLM_RESPONSE_STREAM" and isinstance(content, str) and content:
+                    yield "delta", content
+                elif event == "FINAL_RESPONSE":
+                    text = content.get("response") if isinstance(content, dict) else None
+                    if text:
+                        yield "final", text
+                elif event == "ERROR":
+                    log.error("Agent error chunk: %s", json.dumps(chunk)[:500])
+                    yield "error", None
+                    return
+                elif event == "STREAM_END":
+                    return
+                else:
+                    yield "keepalive", None
+            return
+
+
 @router.post("/message")
 async def message(req: MessageRequest, request: Request):
     session_id = _verify(req.session)
@@ -220,52 +278,44 @@ async def message(req: MessageRequest, request: Request):
     url = f"{PF_BASE_URL}/purplefabric/v1/interaction/sessions/{session_id}/messages"
 
     async def relay():
-        try:
-            for attempt in (1, 2):
-                token = await _tokens.get(_client, force_refresh=(attempt == 2))
-                async with _client.stream(
-                    "POST",
-                    url,
-                    headers={"Authorization": f"Bearer {token}", "apikey": apikey, "Accept": "text/event-stream"},
-                    json={"query": query, "response_mode": "stream"},
-                ) as resp:
-                    if resp.status_code == 401 and attempt == 1:
-                        continue  # token expired server-side; log in again and retry once
-                    if resp.status_code != 200:
-                        body = (await resp.aread())[:300]
-                        log.error("Send message failed: HTTP %s %s", resp.status_code, body)
-                        yield _sse({"type": "error", "text": FALLBACK_ERROR})
-                        return
-                    async for line in resp.aiter_lines():
-                        if not line.startswith("data:"):
-                            continue
-                        try:
-                            chunk = json.loads(line[5:].strip())
-                        except ValueError:
-                            continue
-                        event = chunk.get("event")
-                        content = chunk.get("content")
-                        if event == "LLM_RESPONSE_STREAM" and isinstance(content, str) and content:
-                            yield _sse({"type": "delta", "text": content})
-                        elif event == "FINAL_RESPONSE":
-                            text = content.get("response") if isinstance(content, dict) else None
-                            if text:
-                                yield _sse({"type": "final", "text": text})
-                        elif event == "ERROR":
-                            log.error("Agent error chunk: %s", json.dumps(chunk)[:500])
-                            yield _sse({"type": "error", "text": FALLBACK_ERROR})
-                            return
-                        elif event == "STREAM_END":
-                            break
-                        else:
-                            # init / MESSAGE_DETAILS / heartbeat: keep the browser
-                            # connection alive through proxies without sending content.
-                            yield ": keep-alive\n\n"
-                    yield _sse({"type": "end"})
-                    return
-        except httpx.HTTPError as e:
-            log.error("Relay stream failed: %s", e)
-            yield _sse({"type": "error", "text": FALLBACK_ERROR})
+        # Two tries: a transient platform failure (Bedrock capacity, a dropped
+        # connection) is retried once, invisibly, as long as nothing has been
+        # shown to the visitor yet.
+        for attempt in (1, 2):
+            held, streaming, failed = "", False, False
+            try:
+                async for kind, text in _upstream_events(url, query, apikey):
+                    if kind == "keepalive":
+                        # Keeps the browser connection open through proxies.
+                        yield ": keep-alive\n\n"
+                        continue
+                    if kind == "error":
+                        failed = True
+                        break
+                    if streaming:
+                        yield _sse({"type": kind, "text": text})
+                        continue
+                    held = text if kind == "final" else held + text
+                    if UPSTREAM_ERROR_RE.search(held):
+                        log.warning("Agent replied with a platform error (attempt %d): %s", attempt, held[:300])
+                        failed = True
+                        break
+                    if kind == "final" or len(held) >= HOLD_CHARS:
+                        streaming = True
+                        yield _sse({"type": kind, "text": held})
+            except httpx.HTTPError as e:
+                log.error("Relay stream failed (attempt %d): %s", attempt, e)
+                failed = True
+
+            if not failed:
+                if held and not streaming:  # short reply that never reached HOLD_CHARS
+                    yield _sse({"type": "final", "text": held})
+                yield _sse({"type": "end"})
+                return
+            if streaming or attempt == 2:
+                yield _sse({"type": "error", "text": FALLBACK_ERROR})
+                return
+            await asyncio.sleep(RETRY_DELAY_S)
 
     return StreamingResponse(
         relay(),
