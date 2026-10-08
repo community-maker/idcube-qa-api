@@ -517,7 +517,8 @@ def strip_placeholder_blocks(markdown: str) -> str:
     return cleaned
 
 
-def crawl_pages(urls_with_lastmod, session, out_dir: Path, manifest: dict, delay: float, log_file, pdf_sink=None):
+def crawl_pages(urls_with_lastmod, session, out_dir: Path, manifest: dict, delay: float, log_file,
+                pdf_sink=None, gone_sink=None):
     pages_dir = out_dir / "pages"
     pages_dir.mkdir(parents=True, exist_ok=True)
 
@@ -529,6 +530,8 @@ def crawl_pages(urls_with_lastmod, session, out_dir: Path, manifest: dict, delay
         resp = fetch(url, session)
         if resp is None or resp.status_code != 200:
             log(f"  ! skip (status={getattr(resp, 'status_code', None)})", log_file)
+            if gone_sink is not None and resp is not None and resp.status_code in GONE_STATUSES:
+                gone_sink.add(url)
             failed += 1
             continue
         raw_markdown = html_to_clean_markdown(resp.text, url, pdf_sink)
@@ -685,7 +688,8 @@ def crawl_faq_page(session, out_dir: Path, manifest: dict, log_file):
     return {FAQ_URL: {"hash": h, "lastmod": None, "scraped_at": record["scraped_at"], "slug": slug}}
 
 
-def crawl_pdfs(session, out_dir: Path, delay: float, log_file, limit=None, extra_urls=(), listed_sink=None):
+def crawl_pdfs(session, out_dir: Path, delay: float, log_file, limit=None, extra_urls=(),
+               listed_sink=None, gone_sink=None):
     try:
         from pypdf import PdfReader
     except ImportError:
@@ -713,6 +717,8 @@ def crawl_pdfs(session, out_dir: Path, delay: float, log_file, limit=None, extra
         resp = fetch(url, session)
         if resp is None or resp.status_code != 200:
             log(f"  ! skip (status={getattr(resp, 'status_code', None)})", log_file)
+            if gone_sink is not None and resp is not None and resp.status_code in GONE_STATUSES:
+                gone_sink.add(url)
             continue
         try:
             reader = PdfReader(io.BytesIO(resp.content))
@@ -742,14 +748,18 @@ def crawl_pdfs(session, out_dir: Path, delay: float, log_file, limit=None, extra
 MAX_PRUNE_FRACTION = 0.2
 
 
-def prune_removed(folder: Path, keep_urls: set, log_file) -> int:
-    """Delete saved documents whose URL the site no longer lists, so pages
-    removed from idcubesystems.com stop being indexed and cited. Keyed on
-    what the sitemaps/pages list this run -- not on fetch success -- so a
-    page that merely failed to load keeps last week's copy. Refuses to
-    delete more than MAX_PRUNE_FRACTION in one run: a mass removal means the
-    sitemap itself failed (e.g. a Cloudflare block), not that the site
-    deleted most of its pages."""
+GONE_STATUSES = (404, 410)
+
+
+def prune_removed(folder: Path, keep_urls: set, log_file, gone=frozenset()) -> int:
+    """Delete saved documents the site no longer has, so they stop being
+    indexed and cited: URLs no longer listed (sitemaps + page links), and
+    URLs that answered 404/410 this run -- a page can keep linking a PDF
+    that's been deleted. Other fetch failures (timeouts, 5xx, a Cloudflare
+    challenge) keep last week's copy, since those are usually temporary.
+    Refuses to delete more than MAX_PRUNE_FRACTION in one run: a mass
+    removal means the crawl itself failed, not that the site deleted most
+    of its pages."""
     files = [f for f in folder.glob("*.json") if not f.name.startswith("documents-catalog-")]
     stale = []
     for f in files:
@@ -757,7 +767,7 @@ def prune_removed(folder: Path, keep_urls: set, log_file) -> int:
             url = json.loads(f.read_text(encoding="utf-8")).get("url")
         except (ValueError, OSError):
             continue
-        if url and url not in keep_urls:
+        if url and (url not in keep_urls or url in gone):
             stale.append((f, url))
     if files and len(stale) > MAX_PRUNE_FRACTION * len(files):
         log(f"  ! NOT pruning {folder.name}/: {len(stale)} of {len(files)} would be removed -- "
@@ -867,9 +877,10 @@ def main():
         urls_with_lastmod = urls_with_lastmod[: args.limit]
     log(f"Total unique pages to crawl: {len(urls_with_lastmod)}", log_file)
 
-    linked_pdfs = set()
+    linked_pdfs, gone = set(), set()
     page_manifest = crawl_pages(
-        urls_with_lastmod, session, out_dir, manifest, args.delay, log_file, pdf_sink=linked_pdfs
+        urls_with_lastmod, session, out_dir, manifest, args.delay, log_file,
+        pdf_sink=linked_pdfs, gone_sink=gone,
     )
     manifest.update(page_manifest)
 
@@ -880,15 +891,16 @@ def main():
     if args.include_pdf:
         pdf_manifest = crawl_pdfs(
             session, out_dir, args.delay, log_file, limit=args.limit,
-            extra_urls=linked_pdfs, listed_sink=listed_pdfs,
+            extra_urls=linked_pdfs, listed_sink=listed_pdfs, gone_sink=gone,
         )
         manifest.update(pdf_manifest)
         write_documents_catalog(pdf_manifest.keys(), out_dir, log_file)
 
     if not args.limit:  # a --limit test run sees only part of the site
-        removed = prune_removed(out_dir / "pages", {u for u, _ in urls_with_lastmod} | {FAQ_URL}, log_file)
+        listed_pages = {u for u, _ in urls_with_lastmod} | {FAQ_URL}
+        removed = prune_removed(out_dir / "pages", listed_pages, log_file, gone)
         if args.include_pdf:
-            removed += prune_removed(out_dir / "pdfs", listed_pdfs, log_file)
+            removed += prune_removed(out_dir / "pdfs", listed_pdfs, log_file, gone)
         log(f"Pruned {removed} documents no longer on the site", log_file)
 
     write_json(manifest_path, manifest)
