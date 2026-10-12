@@ -64,7 +64,7 @@ from bs4 import BeautifulSoup
 from markdownify import markdownify as html_to_markdown
 
 BASE = "https://www.idcubesystems.com"
-HOMEPAGE_URL = BASE + "/in/en/"
+HOMEPAGE_URL = BASE + "/"
 
 SITEMAP_SETS = {
     "global": ["/sitemap.xml"],
@@ -837,8 +837,9 @@ def write_documents_catalog(pdf_urls, out_dir: Path, log_file) -> int:
 
 def main():
     ap = argparse.ArgumentParser(description="Crawl idcubesystems.com for RAG ingestion")
-    ap.add_argument("--region", choices=["global", "in", "us", "mea", "all"], default="in",
-                     help="Which sitemap set to crawl (default: in = India site)")
+    ap.add_argument("--region", choices=["global", "in", "us", "mea", "all"], default="global",
+                     help="Which version of the site to crawl (default: global, the site's "
+                          "default region; 'all' adds the /in/, /us/ and /mea/ pages)")
     ap.add_argument("--out", default="data", help="Output directory")
     ap.add_argument("--delay", type=float, default=1.5, help="Seconds between page requests")
     ap.add_argument("--include-pdf", action="store_true", help="Also crawl PDFs from sitemap-pdf.xml")
@@ -862,6 +863,12 @@ def main():
             log(f"Resolving sitemap set '{region}': {BASE + sm}", log_file)
             for url, lastmod in resolve_sitemap(BASE + sm, session, seen_sitemaps, log_file):
                 all_urls[url] = lastmod
+
+    # The global sitemap index also nests the India/US/MEA sitemaps, so
+    # "global" has to be filtered by URL, not just by which sitemap we start at.
+    if args.region != "all":
+        all_urls = {u: lm for u, lm in all_urls.items() if region_of(u) == args.region}
+        log(f"Kept {len(all_urls)} URLs belonging to the '{args.region}' site", log_file)
 
     for url in EXTRA_URLS:
         all_urls.setdefault(url, None)

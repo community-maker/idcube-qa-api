@@ -38,7 +38,7 @@ jobs:
       - run: pip install -r pipeline/requirements.txt
 
       - name: Scrape idcubesystems.com (pages, PDFs, FAQs)
-        run: python pipeline/idcube_scraper.py --region all --out data --include-pdf
+        run: python pipeline/idcube_scraper.py --region global --out data --include-pdf
 
       - name: Chunk
         run: python pipeline/chunker.py --data-dir data --out chunks.jsonl

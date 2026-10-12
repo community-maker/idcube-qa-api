@@ -176,6 +176,39 @@ def title_from_url(url: str) -> str:
     return re.sub(r"[-_]+", " ", stem).strip()
 
 
+TITLE_SUFFIX_RE = re.compile(r"\s*\|\s*IDCUBE.*$", re.IGNORECASE)
+DESCRIPTION_CONTACT_RE = re.compile(r"\s*Call:.*$", re.IGNORECASE | re.DOTALL)
+H1_RE = re.compile(r"^#\s+(.+)$", re.MULTILINE)
+
+
+def summary_chunk(doc: dict):
+    """A short overview chunk per page from its URL slug, title, H1 and meta
+    description. Questions like "tell me about GreenID" otherwise matched
+    short "GreenID" teaser blurbs on other pages -- and "Green Initiative"
+    sections -- ahead of the product page itself, whose overview is a long
+    feature-heavy chunk. Meta descriptions are written to summarise exactly
+    that, so they embed close to "what is X" questions."""
+    description = DESCRIPTION_CONTACT_RE.sub("", doc.get("description") or "").strip()
+    if not description or doc["url"].endswith(".pdf"):
+        return None
+    slug = urlparse(doc["url"]).path.strip("/").rsplit("/", 1)[-1]
+    product = re.sub(r"[-_]+", " ", slug).strip()
+    title = TITLE_SUFFIX_RE.sub("", doc.get("title") or "").strip()
+    h1 = H1_RE.search(doc.get("markdown") or "")
+    parts = [p for p in (product, title, h1.group(1).strip() if h1 else "", description) if p]
+    text = "\n".join(dict.fromkeys(parts))  # drop exact repeats, keep order
+    if len(text.split()) < 8:
+        return None
+    return {
+        "url": doc["url"],
+        "title": doc.get("title"),
+        "source_type": "page",
+        "heading_path": "Page summary",
+        "text": text,
+        "word_count": len(text.split()),
+    }
+
+
 def chunk_document(doc: dict, source_type: str):
     # PDF records carry plain "text" only (no markdown) -- without this
     # fallback every PDF was silently skipped.
@@ -185,6 +218,10 @@ def chunk_document(doc: dict, source_type: str):
     title = doc.get("title") or title_from_url(doc["url"])
 
     chunks = []
+    if source_type == "page":
+        summary = summary_chunk(doc)
+        if summary:
+            chunks.append(summary)
     for heading_path, section_text in split_by_headings(markdown):
         section_text = section_text.strip()
         if not section_text:
