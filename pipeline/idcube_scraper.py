@@ -779,6 +779,38 @@ def prune_removed(folder: Path, keep_urls: set, log_file, gone=frozenset()) -> i
     return len(stale)
 
 
+REGION_HOMEPAGES = {"global": BASE + "/", "in": BASE + "/in/en/", "us": BASE + "/us/en/", "mea": BASE + "/mea/en/"}
+NON_CONTENT_PATH_RE = re.compile(
+    r"/(wp-admin|wp-login|wp-json|feed|tag|author|cdn-cgi)/|^/sitemap/?$|\.(pdf|jpe?g|png|svg|zip)$",
+    re.IGNORECASE,
+)
+
+
+def discover_menu_pages(session, regions, known: dict, log_file) -> dict:
+    """Pages the site links from its homepage/menu but leaves out of its
+    sitemaps (e.g. /products/devices/controllers/openhex/ -- a product in
+    the main menu that no sitemap lists). The menu is the site's own list of
+    what matters, so anything it links is crawled too."""
+    found = {}
+    for region in regions:
+        resp = fetch(REGION_HOMEPAGES[region], session)
+        if resp is None or resp.status_code != 200:
+            log(f"  ! could not load {REGION_HOMEPAGES[region]} for menu links", log_file)
+            continue
+        for a in BeautifulSoup(resp.text, "lxml").find_all("a", href=True):
+            url = urllib.parse.urldefrag(urllib.parse.urljoin(BASE + "/", a["href"].strip()))[0].split("?")[0]
+            parsed = urllib.parse.urlparse(url)
+            if parsed.hostname != urllib.parse.urlparse(BASE).hostname or NON_CONTENT_PATH_RE.search(parsed.path):
+                continue
+            if not url.endswith("/"):
+                url += "/"
+            if region_of(url) == region and url not in known:
+                found[url] = None
+    for url in sorted(found):
+        log(f"  + linked from the menu but missing from the sitemap: {url}", log_file)
+    return found
+
+
 def upload_month(url: str) -> str:
     """'/wp-content/uploads/2025/09/x.pdf' -> '2025/09' (sorts newest last)."""
     m = re.search(r"/uploads/(\d{4}/\d{2})/", url)
@@ -869,6 +901,8 @@ def main():
     if args.region != "all":
         all_urls = {u: lm for u, lm in all_urls.items() if region_of(u) == args.region}
         log(f"Kept {len(all_urls)} URLs belonging to the '{args.region}' site", log_file)
+
+    all_urls.update(discover_menu_pages(session, regions, all_urls, log_file))
 
     for url in EXTRA_URLS:
         all_urls.setdefault(url, None)
