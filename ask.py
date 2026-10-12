@@ -51,6 +51,10 @@ PRODUCT_PAGES = [
     (re.compile(r"\baccess ?master\b", re.I), _SITE + "/products/solutions/access-control/"),
     (re.compile(r"\bhelix\b", re.I), _SITE + "/products/platforms/access360-helix/"),
     (re.compile(r"\baccess ?360[ .]?ai\b", re.I), _SITE + "/products/platforms/access360-ai/"),
+    (re.compile(r"\bmercury\b", re.I), _SITE + "/products/devices/controllers/mercury-icm/"),
+    (re.compile(r"\baero\b", re.I), _SITE + "/products/devices/controllers/aero-ica/"),
+    (re.compile(r"\bopen ?hex\b", re.I), _SITE + "/products/devices/controllers/openhex/"),
+    (re.compile(r"\baccess ?box\b", re.I), _SITE + "/products/devices/enclosure/access-box/"),
 ]
 PINNED_PER_PRODUCT = 3
 

@@ -59,6 +59,9 @@ jobs:
             exit 0
           fi
           git commit -m "Weekly data refresh $(date -u +%F)"
+          # The run takes ~30 min; if anyone pushed meanwhile (e.g. a README
+          # edit), replay this index commit on top instead of failing.
+          git pull --rebase origin main
           git push
 
       - name: Keep the crawl log for debugging
