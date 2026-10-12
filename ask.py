@@ -15,6 +15,7 @@ Usage:
 
 import argparse
 import os
+import re
 import sys
 
 import chromadb
@@ -30,28 +31,59 @@ import chromadb
 COLLECTION_NAME = "idcube_india"
 TOP_K = 8
 
-SYSTEM_PROMPT = """You are a support assistant for IDCUBE Systems' India website \
-(idcubesystems.com/in/en). Answer ONLY using the provided context chunks -- \
+SYSTEM_PROMPT = """You are a support assistant for IDCUBE Systems' website \
+(idcubesystems.com). Answer ONLY using the provided context chunks -- \
 they are excerpts from the company's own website and PDFs. If the answer \
 isn't in the context, say you don't know and suggest the user contact IDCUBE \
-directly (contact@idcubesystems.com / +91 7676110110). Do not invent product \
+directly (contact@idcubesystems.com). Do not invent product \
 names, specs, or prices that aren't in the context. Keep answers concise."""
+
+_SITE = "https://www.idcubesystems.com"
+# When a question names a product, its own page should lead the results.
+# The embedding model splits "GreenID" into "green"+"id", so "tell me about
+# GreenID" otherwise ranks "Green Initiative" sections and short GreenID
+# teasers from other pages above the GreenID page's feature list.
+PRODUCT_PAGES = [
+    (re.compile(r"\bgreen ?id\b", re.I), _SITE + "/products/solutions/greenid/"),
+    (re.compile(r"\bez ?visit", re.I), _SITE + "/products/solutions/visitor-management/"),
+    (re.compile(r"\battendio", re.I), _SITE + "/products/solutions/attendance/"),
+    (re.compile(r"\bainsights?\b", re.I), _SITE + "/products/solutions/analytical-dashboard/"),
+    (re.compile(r"\baccess ?master\b", re.I), _SITE + "/products/solutions/access-control/"),
+    (re.compile(r"\bhelix\b", re.I), _SITE + "/products/platforms/access360-helix/"),
+    (re.compile(r"\baccess ?360[ .]?ai\b", re.I), _SITE + "/products/platforms/access360-ai/"),
+]
+PINNED_PER_PRODUCT = 3
+
+
+def _query(collection, question, n, where=None):
+    # build_index.py stores two vectors per chunk (plain + title/heading
+    # context), so over-fetch 2x and let the caller keep each chunk once.
+    kwargs = {"query_texts": [question], "n_results": min(n * 2, collection.count())}
+    if where:
+        kwargs["where"] = where
+    results = collection.query(**kwargs)
+    return [{"text": doc, **meta} for doc, meta in zip(results["documents"][0], results["metadatas"][0])]
+
+
+def _unique(rows, limit):
+    out, seen = [], set()
+    for c in rows:
+        chunk_id = c.get("chunk_id") or c["text"]
+        if chunk_id not in seen:
+            seen.add(chunk_id)
+            out.append(c)
+            if len(out) == limit:
+                break
+    return out
 
 
 def retrieve(question: str, collection, k=TOP_K):
-    # build_index.py stores two vectors per chunk (plain + title/heading
-    # context), so over-fetch and keep each chunk once, in best-match order.
-    results = collection.query(query_texts=[question], n_results=min(k * 2, collection.count()))
-    chunks, seen = [], set()
-    for doc, meta in zip(results["documents"][0], results["metadatas"][0]):
-        chunk_id = meta.get("chunk_id") or doc
-        if chunk_id in seen:
-            continue
-        seen.add(chunk_id)
-        chunks.append({"text": doc, **meta})
-        if len(chunks) == k:
-            break
-    return chunks
+    pinned = []
+    for pattern, page_url in PRODUCT_PAGES:
+        if pattern.search(question):
+            rows = _query(collection, question, PINNED_PER_PRODUCT, where={"url": page_url})
+            pinned += _unique(rows, PINNED_PER_PRODUCT)
+    return _unique(pinned + _query(collection, question, k), k)
 
 
 def build_context(chunks):
