@@ -17,19 +17,58 @@ import argparse
 import os
 import re
 import sys
+from functools import cached_property
 
 import chromadb
+from chromadb.utils.embedding_functions.onnx_mini_lm_l6_v2 import ONNXMiniLM_L6_V2
 
 # Embedding is handled by Chroma's built-in default embedding function (a
 # local ONNX build of all-MiniLM-L6-v2, via onnxruntime) rather than
 # sentence-transformers/torch -- functionally the same model, but without
 # torch's ~400MB+ runtime footprint, which matters on a memory-capped free
-# hosting tier. Both build_index.py (index time) and this module (query
-# time) must use the same embedding function for search to work, which
-# Chroma's collection object handles automatically as long as neither side
-# overrides it.
+# hosting tier. build_index.py (index time) uses Chroma's default; queries
+# use QueryEmbedder below, the same model tuned for one short question.
 COLLECTION_NAME = "idcube_india"
 TOP_K = 8
+
+
+class QueryEmbedder(ONNXMiniLM_L6_V2):
+    """Chroma's default embedding model, tuned for embedding one question.
+
+    Chroma pads every input to 256 tokens and lets onnxruntime start a
+    spinning thread per host core. On Render's 0.1-CPU free tier that made
+    each search take 7-13 s. Without padding (mean pooling ignores pad
+    tokens, so the vectors are identical) and on one thread, a question
+    embeds in under 10 ms locally.
+    """
+
+    @cached_property
+    def tokenizer(self):
+        tok = super().tokenizer
+        tok.no_padding()
+        return tok
+
+    @cached_property
+    def model(self):
+        so = self.ort.SessionOptions()
+        so.log_severity_level = 3
+        so.graph_optimization_level = self.ort.GraphOptimizationLevel.ORT_ENABLE_ALL
+        so.intra_op_num_threads = 1
+        so.inter_op_num_threads = 1
+        so.add_session_config_entry("session.intra_op.allow_spinning", "0")
+        return self.ort.InferenceSession(
+            os.path.join(self.DOWNLOAD_PATH, self.EXTRACTED_FOLDER_NAME, "model.onnx"),
+            providers=["CPUExecutionProvider"],
+            sess_options=so,
+        )
+
+
+_embedder = QueryEmbedder()
+
+
+def embed_question(question: str):
+    # One question per call: unpadded inputs of different lengths can't batch.
+    return _embedder([question])[0]
 
 SYSTEM_PROMPT = """You are a support assistant for IDCUBE Systems' website \
 (idcubesystems.com). Answer ONLY using the provided context chunks -- \
@@ -59,10 +98,10 @@ PRODUCT_PAGES = [
 PINNED_PER_PRODUCT = 3
 
 
-def _query(collection, question, n, where=None):
+def _query(collection, embedding, n, where=None):
     # build_index.py stores two vectors per chunk (plain + title/heading
     # context), so over-fetch 2x and let the caller keep each chunk once.
-    kwargs = {"query_texts": [question], "n_results": min(n * 2, collection.count())}
+    kwargs = {"query_embeddings": [embedding], "n_results": min(n * 2, collection.count())}
     if where:
         kwargs["where"] = where
     results = collection.query(**kwargs)
@@ -82,12 +121,13 @@ def _unique(rows, limit):
 
 
 def retrieve(question: str, collection, k=TOP_K):
+    embedding = embed_question(question)
     pinned = []
     for pattern, page_url in PRODUCT_PAGES:
         if pattern.search(question):
-            rows = _query(collection, question, PINNED_PER_PRODUCT, where={"url": page_url})
+            rows = _query(collection, embedding, PINNED_PER_PRODUCT, where={"url": page_url})
             pinned += _unique(rows, PINNED_PER_PRODUCT)
-    return _unique(pinned + _query(collection, question, k), k)
+    return _unique(pinned + _query(collection, embedding, k), k)
 
 
 def build_context(chunks):

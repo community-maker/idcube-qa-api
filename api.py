@@ -1,24 +1,24 @@
 """
-REST API wrapper around the IDCUBE retrieval index, for an external agent
-platform (Purple Fabric) to use as a "search this website's data" tool.
+The IDCUBE website assistant's server: the retrieval index plus the chat
+relay that answers visitors with AIsha's LangChain agent (see chat_proxy.py
+and aisha_agent.py).
 
-This service does retrieval ONLY: question -> embed -> search Chroma ->
-return the matching chunks. It does not call any LLM itself -- the calling
-agent platform (which has its own LLM step) is expected to take these chunks
-as context and generate the final answer.
+/search does retrieval ONLY: question -> embed -> search Chroma -> return the
+matching chunks. The agent's search_website tool uses the same retrieval.
 
 Run:
-  pip install fastapi uvicorn
+  pip install -r requirements.txt
   uvicorn api:app --host 0.0.0.0 --port 8000
 
 Endpoints:
   POST /search   {"question": "...", "top_k": 8}  ->  {"results": [...]}
   GET  /health
-  /chat/*        website chat relay to Purple Fabric (see chat_proxy.py)
+  /chat/*        website chat with AIsha (see chat_proxy.py)
   GET  /widget.js      the embeddable chat widget
   GET  /widget-demo    a bare page with the widget, for testing before embedding
 """
 
+import logging
 import os
 from pathlib import Path
 
@@ -31,9 +31,10 @@ from pydantic import BaseModel
 from ask import COLLECTION_NAME, TOP_K, retrieve
 from chat_proxy import ALLOWED_ORIGINS, router as chat_router
 
+logging.basicConfig(level=logging.INFO, format="%(levelname)s %(name)s: %(message)s")
+
 app = FastAPI(title="IDCUBE Search API", version="1.0")
-# Browsers may only call /chat/* from the IDCUBE site itself. /search is
-# called server-to-server by Purple Fabric, which CORS doesn't affect.
+# Browsers may only call the API from the IDCUBE site itself.
 app.add_middleware(
     CORSMiddleware,
     allow_origins=ALLOWED_ORIGINS,
@@ -44,13 +45,13 @@ app.include_router(chat_router)
 
 WIDGET_PATH = Path(__file__).with_name("widget.js")
 
-_state = {}
-
 
 @app.on_event("startup")
 def load_index():
     chroma_client = chromadb.PersistentClient(path=os.environ.get("CHROMA_DIR", "chroma_db"))
-    _state["collection"] = chroma_client.get_collection(COLLECTION_NAME)
+    app.state.collection = chroma_client.get_collection(COLLECTION_NAME)
+    # Load the embedding model now, not on the first visitor's search.
+    retrieve("warm up", app.state.collection)
 
 
 class SearchRequest(BaseModel):
@@ -71,7 +72,7 @@ class SearchResponse(BaseModel):
 
 @app.get("/health")
 def health():
-    collection = _state.get("collection")
+    collection = getattr(app.state, "collection", None)
     if collection is None:
         return {"status": "ok", "chunks_indexed": 0}
     unique = (collection.metadata or {}).get("unique_chunks", collection.count())
@@ -105,7 +106,7 @@ def widget_demo():
 def search(req: SearchRequest):
     if not req.question or not req.question.strip():
         raise HTTPException(status_code=400, detail="question must not be empty")
-    chunks = retrieve(req.question, _state["collection"], k=req.top_k)
+    chunks = retrieve(req.question, app.state.collection, k=req.top_k)
     results = [
         SearchResult(
             text=c["text"],
