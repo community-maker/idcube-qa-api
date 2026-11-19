@@ -386,18 +386,31 @@ def extract_client_logos(soup: BeautifulSoup) -> list:
     only ever carry the company name in the image filename -- alt text is
     generic ('AI access control' on every logo) and there's no visible text
     at all. markdownify's img stripping would otherwise silently drop this
-    entirely, so pull it out here before that happens."""
+    entirely, so pull it out here before that happens.
+
+    The logos are found two ways: inside the old carousel's "client" class,
+    and between the "Trusted by ..." heading and the next heading (the 2026
+    homepage design has no such class). Lazy-loaded logos keep the real file
+    in data-lazy-src."""
+    imgs = [img for container in soup.select('[class*="client"]') for img in container.find_all("img")]
+    label = soup.find(string=re.compile(r"trusted by", re.I))
+    heading = label.find_parent(re.compile(r"^h[1-6]$")) if label else None
+    if heading:
+        for el in heading.find_all_next():
+            if el.name and re.fullmatch(r"h[1-6]", el.name):
+                break
+            if el.name == "img":
+                imgs.append(el)
     names = []
     seen = set()
-    for container in soup.select('[class*="client"]'):
-        for img in container.find_all("img"):
-            src = img.get("src", "")
-            if not src or not re.search(r"\.(svg|png|jpe?g|webp)(\?|$)", src, re.I):
-                continue
-            name = logo_filename_to_name(src)
-            if name and name.lower() not in seen and name.lower() != "idcube":
-                seen.add(name.lower())
-                names.append(name)
+    for img in imgs:
+        src = img.get("data-lazy-src") or img.get("src", "")
+        if src.startswith("data:") or not re.search(r"\.(svg|png|jpe?g|webp)(\?|$)", src, re.I):
+            continue
+        name = logo_filename_to_name(src)
+        if name and name.lower() not in seen and name.lower() != "idcube":
+            seen.add(name.lower())
+            names.append(name)
     return names
 
 
@@ -760,7 +773,7 @@ def prune_removed(folder: Path, keep_urls: set, log_file, gone=frozenset()) -> i
     Refuses to delete more than MAX_PRUNE_FRACTION in one run: a mass
     removal means the crawl itself failed, not that the site deleted most
     of its pages."""
-    files = [f for f in folder.glob("*.json") if not f.name.startswith("documents-catalog-")]
+    files = [f for f in folder.glob("*.json") if not f.name.startswith(("documents-catalog-", "devices-overview", "leadership-", "customers-"))]
     stale = []
     for f in files:
         try:
@@ -867,6 +880,267 @@ def write_documents_catalog(pdf_urls, out_dir: Path, log_file) -> int:
     return written
 
 
+DEVICES_OVERVIEW_URL = BASE + "/support/resource-center/datasheet/"
+DEVICE_GROUPS = [  # /products/devices/<segment>/ -> heading
+    ("controllers", "Controllers"),
+    ("readers", "Readers"),
+    ("credentials", "Credentials (cards, tags, mobile and biometrics)"),
+    ("enclosure", "Enclosures"),
+]
+
+
+# Short family names for the overview; a family not listed here is named
+# from its page title.
+DEVICE_FAMILIES = {
+    "mercury-icm": "Mercury", "aero-ica": "Aero", "openhex": "OpenHEX",
+    "smart-card-axs": "AXS+", "long-range-idlr12": "IDLR long-range", "access-box": "Access Box",
+}
+# Model numbers as the device pages write them, per device type.
+MODEL_RES = {
+    "controllers": re.compile(r"\b(?:MP|LP)\s?\d{4}\b|\bMR\s?\d{2}(?:IN|OUT|E)?\b|\bX\d{2,4}\b", re.I),
+    "readers": re.compile(r"\bIDLR-?\s?\d{2}\b", re.I),
+    "enclosure": re.compile(r"(?<=Access Box )(?:E\d|\d\.\d)\b", re.I),
+}
+
+
+def device_name(title: str) -> str:
+    """'HID Mercury MP1501 Controller | Single Door ... | IDCUBE' -> 'HID Mercury MP1501 Controller'."""
+    return re.split(r"\s+\|\s+|:\s", title or "")[0].strip()
+
+
+def model_code(raw: str) -> str:
+    """'MP 1501' -> 'MP1501', 'IDLR12' -> 'IDLR-12', 'MR62e' -> 'MR62E'."""
+    code = re.sub(r"\s+", "", raw.upper())
+    return re.sub(r"^IDLR-?", "IDLR-", code)
+
+
+def model_sort_key(code: str):
+    return [int(p) if p.isdigit() else p for p in re.split(r"(\d+)", code)]
+
+
+def datasheet_names(catalog_file: Path) -> list:
+    """Datasheet labels from a documents catalog, one per product: 'IDCUBE
+    ICMLP1501 V1.1 datasheet' and 'ICMLP 1501 datasheet' are the same item."""
+    labels = re.findall(r"^## (.+)$", json.loads(catalog_file.read_text(encoding="utf-8"))["markdown"], re.M)
+    names = {}
+    for label in labels:
+        name = re.sub(r"\s+(datasheet|V\d+(\.\d+)*)\b", "", re.sub(r"^IDCUBE\s+", "", label), flags=re.I).strip()
+        names.setdefault(re.sub(r"\W+", "", name.lower()), name)
+    return sorted(names.values(), key=str.lower)
+
+
+def write_devices_overview(out_dir: Path, log_file) -> int:
+    """One page listing IDCUBE's whole hardware range. The site has no such
+    page (/products/devices/ is a 404) and a search returns only a few
+    excerpts, so "list all your readers and controllers" would otherwise see
+    a fraction of the range. Built from this run's device pages and datasheet
+    catalog, so it never lists a product the site no longer has."""
+    pages_dir = out_dir / "pages"
+    # families[type][family slug] = {"name", "url", "models"}; credentials are
+    # types of credential rather than model numbers, so each page is one entry.
+    families = defaultdict(dict)
+    for f in pages_dir.glob("*.json"):
+        if f.name.startswith(("documents-catalog-", "devices-overview", "leadership-", "customers-")):
+            continue
+        page = json.loads(f.read_text(encoding="utf-8"))
+        m = re.match(re.escape(BASE) + r"/products/devices/([^/]+)/(.*)$", page.get("url", ""))
+        if not m or region_of(page["url"]) != "global":
+            continue
+        seg, rest = m.groups()
+        slug = rest.split("/")[0] if seg != "credentials" else rest.rstrip("/") or "credentials"
+        family = families[seg].setdefault(slug, {"name": None, "url": None, "models": set()})
+        if rest.strip("/") == slug or seg == "credentials":  # the family's own page
+            family["url"] = page["url"]
+            family["name"] = DEVICE_FAMILIES.get(slug) or device_name(page.get("title"))
+        if seg in MODEL_RES:
+            family["models"] |= {model_code(c) for c in MODEL_RES[seg].findall(page.get("text", ""))}
+    if not families:
+        log("  ! no device pages this run; devices overview skipped", log_file)
+        return 0
+    # Reader models also appear in reader/credential datasheets (e.g. IDLR-06).
+    for f in (out_dir / "pdfs").glob("*.json"):
+        codes = {model_code(c) for c in MODEL_RES["readers"].findall(
+            json.loads(f.read_text(encoding="utf-8")).get("text", ""))}
+        for family in families.get("readers", {}).values():
+            if codes and any(m.startswith("IDLR-") for m in family["models"]):
+                family["models"] |= codes
+
+    def entry(family):
+        models = sorted(family["models"], key=model_sort_key)
+        return f"{family['name']} ({', '.join(models)})" if models else family["name"]
+
+    sheets = {cat: datasheet_names(pages_dir / f"documents-catalog-{cat}.json")
+              for cat in ("controllers", "credentials")
+              if (pages_dir / f"documents-catalog-{cat}.json").exists()}
+    groups = [(seg, heading, sorted((f for f in families[seg].values() if f["url"]), key=lambda f: f["name"]))
+              for seg, heading in DEVICE_GROUPS if families.get(seg)]
+    summary, total_models = [], 0
+    for seg, heading, fams in groups:
+        kind = heading.split(" (")[0].lower()
+        if seg == "credentials":
+            summary.append(f"{kind}: {len(fams)} types: {', '.join(f['name'] for f in fams)}")
+            continue
+        n_models = sum(max(len(f["models"]), 1) for f in fams)
+        total_models += n_models
+        summary.append(f"{kind}: {len(fams)} {'family' if len(fams) == 1 else 'families'}, "
+                       f"{n_models} {'model' if n_models == 1 else 'models'}: {'; '.join(entry(f) for f in fams)}")
+    lines = ["# IDCUBE hardware: the complete device range",
+             "\n## All IDCUBE hardware products",
+             f"\nIDCUBE's hardware range has {len(groups)} types of device. " + ". ".join(
+                 s[0].upper() + s[1:] for s in summary) +
+             f". In total: {total_models} controller, reader and enclosure models"
+             + (f", plus {len(families['credentials'])} credential types." if families.get("credentials") else ".")]
+    for seg, heading, fams in groups:
+        lines.append(f"\n## IDCUBE {heading}\n")
+        lines += [f"- {entry(f)}: {f['url']}" for f in fams]
+    if sheets.get("controllers"):
+        lines.append(f"\n## Controller and enclosure datasheets ({len(sheets['controllers'])} models)\n\n"
+                     + ", ".join(sheets["controllers"]) + f". All on {DEVICES_OVERVIEW_URL}")
+    if sheets.get("credentials"):
+        lines.append(f"\n## Reader, card and credential datasheets ({len(sheets['credentials'])} models)\n\n"
+                     + ", ".join(sheets["credentials"]) + f". All on {DEVICES_OVERVIEW_URL}")
+    markdown = "\n".join(lines)
+    text = markdown_to_text(markdown)
+    write_json(pages_dir / "devices-overview.json", {
+        "url": DEVICES_OVERVIEW_URL,
+        "title": "IDCUBE hardware range: controllers, readers, credentials and enclosures",
+        "description": "Every IDCUBE hardware product on the website, with links and datasheets.",
+        "date": None,
+        "lastmod_sitemap": None,
+        "scraped_at": datetime.now(timezone.utc).isoformat(),
+        "content_hash": content_hash(markdown),
+        "changed_since_last_run": True,
+        "markdown": markdown,
+        "text": text,
+        "word_count": len(text.split()),
+    })
+    log(f"[devices] overview lists {total_models} hardware models and "
+        f"{sum(len(v) for v in sheets.values())} datasheets", log_file)
+    return total_models
+
+
+def write_customers_page(out_dir: Path, log_file) -> int:
+    """One page naming IDCUBE's customers: the homepage's "Trusted by ..."
+    line and logos, plus every published case study (web pages and PDFs).
+    Spread over the homepage and dozens of case-study excerpts, "who are your
+    big customers" would otherwise find only a few. Built from this run's
+    pages, so it follows the site."""
+    pages_dir = out_dir / "pages"
+    trust, clients, studies = "", [], {}
+    for f in sorted(pages_dir.glob("*.json")):
+        if f.name.startswith(("documents-catalog-", "devices-overview", "leadership-", "customers-")):
+            continue
+        page = json.loads(f.read_text(encoding="utf-8"))
+        if page.get("url") == HOMEPAGE_URL:
+            # Saved pages keep the logo names only in the customers paragraph
+            # crawl_pages appends to the homepage ("... include A, B and C.").
+            m = re.search(r"IDCUBE access control solutions include (.+?)\.\s*$", page.get("markdown", ""), re.M)
+            clients = re.split(r",\s*|\s+and\s+", m.group(1)) if m else []
+            m = re.search(r"Trusted by [^\n#*]+", page.get("markdown", ""), re.I)
+            trust = m.group(0).strip().rstrip(".") if m else ""
+        elif "/case-study/" in page.get("url", "") and region_of(page["url"]) == "global":
+            studies[device_name(page.get("title")) or page["url"]] = page["url"]
+    catalog = pages_dir / "documents-catalog-case_studies.json"
+    if catalog.exists():
+        for label, url in re.findall(r"^## (.+)\n\n[^\n]*?: (https://\S+)",
+                                     json.loads(catalog.read_text(encoding="utf-8"))["markdown"], re.M):
+            studies.setdefault(f"{label} (PDF)", url)
+    if not clients and not studies:
+        log("  ! no customer logos or case studies this run; customers page skipped", log_file)
+        return 0
+
+    lines = ["# IDCUBE customers and clients", "\n## Who uses IDCUBE"]
+    summary = (f"IDCUBE is {trust[0].lower() + trust[1:]}. " if trust else "")
+    if clients:
+        summary += f"Customers shown on the IDCUBE website include {', '.join(clients)}. "
+    if studies:
+        summary += f"IDCUBE has published {len(studies)} customer case studies, listed below."
+    lines.append("\n" + summary.strip())
+    if studies:
+        lines.append("\n## IDCUBE customer case studies\n")
+        lines += [f"- {name}: {url}" for name, url in sorted(studies.items(), key=lambda s: s[0].lower())]
+    markdown = "\n".join(lines)
+    text = markdown_to_text(markdown)
+    write_json(pages_dir / "customers-overview.json", {
+        "url": HOMEPAGE_URL,
+        "title": "IDCUBE customers and clients",
+        "description": "Organisations that use IDCUBE, and IDCUBE's published case studies.",
+        "date": None,
+        "lastmod_sitemap": None,
+        "scraped_at": datetime.now(timezone.utc).isoformat(),
+        "content_hash": content_hash(markdown),
+        "changed_since_last_run": True,
+        "markdown": markdown,
+        "text": text,
+        "word_count": len(text.split()),
+    })
+    log(f"[customers] {len(clients)} homepage customers, {len(studies)} case studies", log_file)
+    return len(clients) + len(studies)
+
+
+LEADERSHIP_URL = BASE + "/why-choose-us/"
+# "Divyakant Gupta" on one line, "Founder & CEO, IDCUBE" on the next: how the
+# Leadership section, contact pages and blog author boxes present people.
+PERSON_RE = re.compile(
+    r"^([A-Z][a-z]+(?: [A-Z][a-z]+){1,2})[ \t]*\n\s*"
+    r"((?:Co-?founder|Founder|Chief|CEO|CTO|CFO|COO|CCO|Director|Head|Vice President|VP)[^\n]{0,70})$",
+    re.M)
+
+
+def write_leadership_page(out_dir: Path, log_file) -> int:
+    """One page naming IDCUBE's founders and leaders. They appear on the "why
+    choose us" Leadership section, regional contact pages and blog author
+    boxes -- spread across many small excerpts, so "who are the co-founders"
+    or "leadership team" would often miss someone. Built from this run's
+    pages, so it follows the site when people or titles change."""
+    pages_dir = out_dir / "pages"
+    titles, source = defaultdict(set), {}
+    for f in sorted(pages_dir.glob("*.json")):
+        if f.name.startswith(("documents-catalog-", "devices-overview", "leadership-", "customers-")):
+            continue
+        page = json.loads(f.read_text(encoding="utf-8"))
+        for name, title in PERSON_RE.findall(page.get("text", "")):
+            titles[name].add(re.sub(r",?\s*IDCUBE\s*$", "", title).strip())
+            # Prefer citing the global Leadership page, then any global page.
+            current = source.get(name)
+            if current is None or (region_of(page["url"]) == "global" and
+                                   (region_of(current) != "global" or page["url"] == LEADERSHIP_URL)):
+                source[name] = page["url"]
+    if not titles:
+        log("  ! no leadership names found this run; leadership page skipped", log_file)
+        return 0
+
+    def rank(name):
+        title = max(titles[name], key=len).lower()
+        return (0 if title.startswith("founder") else 1 if "founder" in title else 2, name)
+
+    people = [(name, max(titles[name], key=len)) for name in sorted(titles, key=rank)]
+    founders = [f"{n} ({t})" for n, t in people if "founder" in t.lower()]
+    lines = ["# IDCUBE founders and leadership team",
+             "\n## Who founded IDCUBE and who leads it",
+             f"\nIDCUBE's founders: {'; '.join(founders) or 'not listed on the website'}. "
+             f"Leadership team named on the website: " + "; ".join(f"{n}, {t}" for n, t in people) + "."]
+    lines.append("\n## Where each person appears on the website\n")
+    lines += [f"- {n} ({t}): {source[n]}" for n, t in people]
+    markdown = "\n".join(lines)
+    text = markdown_to_text(markdown)
+    write_json(pages_dir / "leadership-overview.json", {
+        "url": LEADERSHIP_URL,
+        "title": "IDCUBE founders and leadership team",
+        "description": "IDCUBE's founders and the leaders named on the website.",
+        "date": None,
+        "lastmod_sitemap": None,
+        "scraped_at": datetime.now(timezone.utc).isoformat(),
+        "content_hash": content_hash(markdown),
+        "changed_since_last_run": True,
+        "markdown": markdown,
+        "text": text,
+        "word_count": len(text.split()),
+    })
+    log(f"[leadership] {len(people)} people, founders: {', '.join(founders)}", log_file)
+    return len(people)
+
+
 def main():
     ap = argparse.ArgumentParser(description="Crawl idcubesystems.com for RAG ingestion")
     ap.add_argument("--region", choices=["global", "in", "us", "mea", "all"], default="global",
@@ -936,6 +1210,9 @@ def main():
         )
         manifest.update(pdf_manifest)
         write_documents_catalog(pdf_manifest.keys(), out_dir, log_file)
+    write_devices_overview(out_dir, log_file)
+    write_leadership_page(out_dir, log_file)
+    write_customers_page(out_dir, log_file)
 
     if not args.limit:  # a --limit test run sees only part of the site
         listed_pages = {u for u, _ in urls_with_lastmod} | {FAQ_URL}

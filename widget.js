@@ -1,13 +1,14 @@
 /*
  * IDCUBE website chat widget.
  *
- * Embed with one tag (e.g. in the WordPress footer):
- *   <script src="https://idcube-qa-api.onrender.com/widget.js"
- *           data-api="https://idcube-qa-api.onrender.com" defer></script>
+ * Embed with one tag (e.g. in the WordPress footer); the chat server's
+ * address is taken from the script's own src:
+ *   <script src="https://<chat server>/widget.js" defer></script>
  *
- * Optional attributes: data-title, data-color, data-greeting, data-privacy-url.
+ * Optional attributes: data-api (a different server), data-title, data-color,
+ * data-greeting, data-privacy-url.
  *
- * Talks only to the relay in chat_proxy.py -- never to Purple Fabric directly,
+ * Talks only to the relay in chat_proxy.py -- never to the AI model directly,
  * so no credentials ever reach the browser. Renders inside a Shadow DOM so the
  * site theme's CSS can't break it (and it can't break the theme). Agent text is
  * built with DOM APIs, never innerHTML, so model output can't inject markup.
@@ -23,11 +24,11 @@
   const ds = (script && script.dataset) || {};
   const cfg = {
     api: (ds.api || (script ? new URL(script.src).origin : "")).replace(/\/+$/, ""),
-    title: ds.title || "IDCUBE Assistant",
+    title: ds.title || "AIsha",
     color: ds.color || "#0b5cad",
     greeting:
       ds.greeting ||
-      "Hi! I'm the IDCUBE assistant. Ask me about our products, solutions, partners or support.",
+      "Hi, I'm AIsha, IDCUBE's website assistant 👋 Ask me about our products, brochures, a demo or support.",
     privacyUrl: ds.privacyUrl || "https://www.idcubesystems.com/privacy-policy/",
   };
   const FALLBACK =

@@ -17,6 +17,7 @@ import argparse
 import os
 import re
 import sys
+from collections import defaultdict
 from functools import cached_property
 
 import chromadb
@@ -94,8 +95,67 @@ PRODUCT_PAGES = [
     (re.compile(r"\baero\b", re.I), _SITE + "/products/devices/controllers/aero-ica/"),
     (re.compile(r"\bopen ?hex\b", re.I), _SITE + "/products/devices/controllers/openhex/"),
     (re.compile(r"\baccess ?box\b", re.I), _SITE + "/products/devices/enclosure/access-box/"),
+    # Broad questions get the crawler's overview pages (see write_devices_overview,
+    # write_leadership_page and write_customers_page in pipeline/idcube_scraper.py):
+    # otherwise one product page can stand in for the whole range.
+    (re.compile(r"\b(hardware|devices?|readers?|controllers?|enclosures?)\b", re.I),
+     _SITE + "/support/resource-center/datasheet/"),
+    (re.compile(r"\b(co-?founders?|founders?|founded|ceo|leadership|leaders?|management team)\b", re.I),
+     _SITE + "/why-choose-us/"),
+    (re.compile(r"\b(customers?|clients?|trusted by|who uses|companies use)\b", re.I), _SITE + "/"),
 ]
 PINNED_PER_PRODUCT = 3
+
+# The India, USA and MEA sites (/in/en/, /us/en/, /mea/en/) repeat most global
+# pages with small changes, so four near-copies of one section can crowd out
+# everything else. A copy is dropped when the same page's text from the
+# preferred site (the region the question names, else global) says nearly the
+# same thing; sections only one site has -- regional offices, the leadership
+# on the India "why choose us" page -- always stay.
+NEAR_COPY_JACCARD = 0.5
+REGION_PATH_RE = re.compile(r"^(https://www\.idcubesystems\.com)/(in|us|mea)/en/")
+REGION_HINTS = [
+    ("in", re.compile(r"\b(india|indian|mumbai|delhi|bengaluru|bangalore|pune|hyderabad|chennai|"
+                      r"noida|gurugram|gurgaon)\b", re.I)),
+    # Capital "US" only: lower-case "us" is the pronoun.
+    ("us", re.compile(r"(?i:\b(usa|united states|america|american)\b)|\bUS\b")),
+    ("mea", re.compile(r"\b(uae|dubai|abu dhabi|saudi|riyadh|qatar|doha|oman|bahrain|kuwait|gcc|"
+                       r"middle east|africa|mea)\b", re.I)),
+]
+
+
+def _site_of(url):
+    m = REGION_PATH_RE.match(url or "")
+    return m.group(2) if m else "global"
+
+
+def _page_of(url):
+    return REGION_PATH_RE.sub(r"\1/", url or "")
+
+
+def _question_region(question):
+    return next((region for region, pattern in REGION_HINTS if pattern.search(question)), None)
+
+
+def _words(text):
+    return set(re.findall(r"\w+", text.lower()))
+
+
+def _drop_regional_copies(rows, region):
+    preferred = region or "global"
+    kept = defaultdict(list)  # page -> word sets already in the results
+    for c in rows:
+        if _site_of(c.get("url")) == preferred:
+            kept[_page_of(c.get("url"))].append(_words(c["text"]))
+    out = []
+    for c in rows:
+        page, words = _page_of(c.get("url")), _words(c["text"])
+        if _site_of(c.get("url")) != preferred:
+            if any(len(words & k) / max(len(words | k), 1) >= NEAR_COPY_JACCARD for k in kept[page]):
+                continue
+            kept[page].append(words)
+        out.append(c)
+    return out
 
 
 def _query(collection, embedding, n, where=None):
@@ -127,7 +187,9 @@ def retrieve(question: str, collection, k=TOP_K):
         if pattern.search(question):
             rows = _query(collection, embedding, PINNED_PER_PRODUCT, where={"url": page_url})
             pinned += _unique(rows, PINNED_PER_PRODUCT)
-    return _unique(pinned + _query(collection, embedding, k), k)
+    # Over-fetch: regional copies of the same page are dropped next.
+    rows = _query(collection, embedding, k * 3)
+    return _unique(_drop_regional_copies(pinned + rows, _question_region(question)), k)
 
 
 def build_context(chunks):

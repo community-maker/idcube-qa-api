@@ -3,11 +3,13 @@ Live test of AIsha: the real model (LLM_MODEL), real index, the real /chat endpo
 
 Sends a fixed set of visitor questions (products, documents, Hinglish,
 guardrails, a follow-up) and writes every answer with its speed and cost to a
-Markdown report for review. Costs about $0.03-0.05 a run on Haiku 5.5.
+Markdown report for review. Costs about $0.02 a run on Haiku 5.5; --limit runs
+only the first few conversations.
 
-Key: ANTHROPIC_API_KEY, or the first line of ~/.anthropic_key (never printed).
+Key (never printed): ANTHROPIC_API_KEY, or the first line of ~/.anthropic_key.
+For Claude on Microsoft Foundry, also set ANTHROPIC_BASE_URL.
 Usage:
-  python test_chat_live.py --out report.md [--model anthropic:claude-haiku-5-5]
+  python test_chat_live.py --out report.md [--model anthropic:<model>] [--limit 10]
 """
 
 import argparse
@@ -18,9 +20,11 @@ import sys
 import time
 from pathlib import Path
 
-# Haiku 5.5, prompts up to 100K tokens: USD per million tokens.
+# Haiku 5.5, prompts up to 100K tokens: USD per million tokens. Other models
+# are reported at $0.
 PRICE = {"input_tokens": 0.10, "output_tokens": 0.50,
          "cache_read_input_tokens": 0.01, "cache_creation_input_tokens": 0.125}
+KEYS = {"anthropic": ("ANTHROPIC_API_KEY", ".anthropic_key")}
 
 # Each inner list is one conversation; later questions are follow-ups.
 CONVERSATIONS = [
@@ -74,15 +78,19 @@ def main():
     ap = argparse.ArgumentParser()
     ap.add_argument("--out", required=True)
     ap.add_argument("--model", default=None, help="override LLM_MODEL (LangChain provider:model)")
+    ap.add_argument("--limit", type=int, default=None, help="run only the first N conversations")
     args = ap.parse_args()
     if args.model:
         os.environ["LLM_MODEL"] = args.model
+    provider = os.environ.get("LLM_MODEL", "anthropic:").split(":")[0]
+    priced = provider == "anthropic"
 
-    if not os.environ.get("ANTHROPIC_API_KEY") and os.environ.get("LLM_MODEL", "anthropic:").startswith("anthropic:"):
-        key_file = Path.home() / ".anthropic_key"
+    env_var, key_name = KEYS.get(provider, (None, None))
+    if env_var and not os.environ.get(env_var):
+        key_file = Path.home() / key_name
         if not key_file.exists():
-            sys.exit(f"Set ANTHROPIC_API_KEY or put the key in {key_file}")
-        os.environ["ANTHROPIC_API_KEY"] = key_file.read_text(encoding="utf-8").strip().splitlines()[0]
+            sys.exit(f"Set {env_var} or put the key in {key_file}")
+        os.environ[env_var] = key_file.read_text(encoding="utf-8").strip().splitlines()[0]
 
     from fastapi.testclient import TestClient
     import api
@@ -92,7 +100,7 @@ def main():
 
     rows, total_cost, total_time = [], 0.0, 0.0
     with TestClient(api.app) as client:
-        for convo in CONVERSATIONS:
+        for convo in CONVERSATIONS[:args.limit]:
             session = client.post("/chat/session").json()["session"]
             for question in convo:
                 capture.last = {}
@@ -114,7 +122,7 @@ def main():
                             error = event["text"]
                 elapsed = time.monotonic() - started
                 usage = capture.last
-                cost = sum(usage.get(k, 0) * p for k, p in PRICE.items()) / 1e6
+                cost = sum(usage.get(k, 0) * p for k, p in PRICE.items()) / 1e6 if priced else 0.0
                 total_cost += cost
                 total_time += elapsed
                 rows.append((question, final or f"**ERROR:** {error}", elapsed, first_delta, usage, cost))
